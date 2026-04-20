@@ -60,21 +60,25 @@ This proposal depends on the following proposal:
 transactions for that slot.
 
 **MCP transaction** is a Transaction V1-derived signed transaction that adds
-required target slot, target proposer, and last valid slot fields.
+required target cycle, target proposer, and last valid cycle fields.
 
-**Target slot** is the slot for which an MCP transaction or proposer shred is
+**Target cycle** is the cycle for which an MCP transaction or proposer shred is
 intended.
 
-**Target proposer** is the proposer's index in `proposers_at(target_slot)`.
+**Target proposer** is the proposer's index in the proposer committee for the
+slot that contains `target_cycle`.
+
+**Slot for cycle** is the deterministic mapping from a target cycle to the slot
+whose proposer committee is responsible for that cycle.
 
 **Proposer batch** is the ordered set of MCP transactions accepted by a
-proposer for a target slot.
+proposer for a target cycle.
 
 **Proposer shred** is an erasure-coded fragment of a proposer batch. It is not
 a leader block shred and cannot be inserted or replayed as a normal block
 shred.
 
-**Slot-local balance cache** is the proposer-local fee-payer balance cache
+**Cycle-local balance cache** is the proposer-local fee-payer balance cache
 used to reject transactions that cannot pay the base transaction fee and MCP
 inclusion fee.
 
@@ -90,7 +94,7 @@ document are to be interpreted as described in [RFC
 
 A proposer:
 
-1. receives MCP transactions for a signed target slot
+1. receives MCP transactions for a signed target cycle
 2. runs the bankless checks needed to reject obviously invalid or unpaid
    transactions
 3. assembles accepted transactions into a proposer batch
@@ -106,8 +110,8 @@ decide final transaction order.
 
 An MCP transaction is a Transaction V1-derived signed transaction. It keeps the
 Transaction V1 account, instruction, lifetime, config, and signature layout,
-but uses an MCP transaction config mask that adds required target slot, target
-proposer, and last valid slot fields.
+but uses an MCP transaction config mask that adds required target cycle, target
+proposer, and last valid cycle fields.
 
 The encoded transaction is:
 
@@ -142,9 +146,9 @@ bits [2, 3]  order_fee_lamports: u64
 bit  [4]     compute_unit_limit: u32
 bit  [5]     loaded_accounts_data_size_limit: u32
 bit  [6]     heap_size: u32
-bits [7, 8]  target_slot: u64
+bits [7, 8]  target_cycle: u64
 bit  [9]     target_proposer: u32
-bits [10, 11] last_valid_slot: u64
+bits [10, 11] last_valid_cycle: u64
 ```
 
 `inclusion_fee_lamports` is paid for including the transaction in a proposer
@@ -158,22 +162,22 @@ neither bit is set, the order fee is 0.
 The Transaction V1 resource fields are retained, but shifted to bits 4, 5, and
 6 so that bits 0 through 3 can carry the two MCP fee values.
 
-`target_slot` is required. An MCP transaction is invalid if exactly one of
+`target_cycle` is required. An MCP transaction is invalid if exactly one of
 bits 7 or 8 is set, or if neither bit is set.
 
-`target_proposer` is required. It is the proposer's index in
-`proposers_at(target_slot)`, encoded as a little-endian `u32`. The transaction
-is invalid if bit 9 is not set, or if `target_proposer` is not a valid index
-for the target slot's proposer committee.
+`target_proposer` is required. It is the proposer's index in the proposer
+committee for the slot that contains `target_cycle`, encoded as a little-endian
+`u32`. The transaction is invalid if bit 9 is not set, or if `target_proposer`
+is not a valid index for the target cycle's proposer committee.
 
-`last_valid_slot` is required. It is the last slot in which the target
+`last_valid_cycle` is required. It is the last cycle in which the target
 proposer may accept the transaction, encoded as a little-endian `u64`. The
 transaction is invalid if exactly one of bits 10 or 11 is set, or if neither
 bit is set.
 
 The signed message is every field before `Signatures`, including
-`McpTransactionConfigMask`, `ConfigValues`, and therefore `target_slot`,
-`target_proposer`, and `last_valid_slot`. `Signatures[i]` signs that message
+`McpTransactionConfigMask`, `ConfigValues`, and therefore `target_cycle`,
+`target_proposer`, and `last_valid_cycle`. `Signatures[i]` signs that message
 with the key for `Addresses[i]`, as in Transaction V1.
 
 All other Transaction V1 constraints apply unless changed here:
@@ -191,21 +195,21 @@ resource requests come from `McpTransactionConfigMask` and `ConfigValues`.
 ### Fee payer check logic
 
 The proposer performs fee-payer checks against a candidate parent bank for the
-target slot. This bank is the proposer's base bank for the target slot.
+target cycle. This bank is the proposer's base bank for the target cycle.
 
 For each received MCP transaction, the proposer:
 
-1. verifies that the signed `target_slot` matches the slot being proposed
+1. verifies that the signed `target_cycle` matches the cycle being proposed
 2. verifies that the signed `target_proposer` matches the proposer's scheduled
-   index in `proposers_at(target_slot)`
-3. verifies that the current slot is less than or equal to
-   `last_valid_slot`
+   index in `proposers_at(slot_for_cycle(target_cycle))`
+3. verifies that the current cycle is less than or equal to
+   `last_valid_cycle`
 4. sanitizes the transaction
 5. verifies all required signatures
 6. verifies that `LifetimeSpecifier` is usable from the base bank
 7. computes the fee from the base bank fee rules, including the MCP inclusion
    fee
-8. checks the fee payer balance using the slot-local balance cache
+8. checks the fee payer balance using the cycle-local balance cache
 9. accepts the transaction into the proposer batch only if the cache can pay
    the computed fee
 
@@ -218,7 +222,7 @@ fee-payer check unless a later proposal explicitly requires it.
 The balance cache is scoped to:
 
 ```
-target_slot
+target_cycle
 base_bank_hash
 proposer_index
 ```
@@ -251,7 +255,7 @@ Each proposer shred contains:
 ```
 ProposerShred {
     variant: u8,
-    target_slot: u64,
+    target_cycle: u64,
     base_bank_hash: [u8; 32],
     proposer_identity: [u8; 32],
     proposer_index: u8,
@@ -269,18 +273,18 @@ ProposerShred {
 
 `variant` identifies the proposer-shred wire format.
 
-`target_slot` is the slot the batch is intended for.
+`target_cycle` is the cycle the batch is intended for.
 
 `base_bank_hash` identifies the base bank used for proposer fee-payer checks.
 
 `proposer_identity` is the validator identity that signed the shred.
 
-`proposer_index` is the proposer's position in `proposers_at(target_slot)`.
-If a validator appears more than once in the proposer committee, each
-occurrence is a separate proposer index.
+`proposer_index` is the proposer's position in the proposer committee for the
+slot that contains `target_cycle`. If a validator appears more than once in the
+proposer committee, each occurrence is a separate proposer index.
 
 `batch_id` is chosen by the proposer and is monotonically increasing per
-`(target_slot, proposer_index)`.
+`(target_cycle, proposer_index)`.
 
 `fec_set_index`, `shred_index`, `shred_kind`, `num_data_shreds`, and
 `num_coding_shreds` identify the erasure set and the shred's position within
@@ -296,8 +300,9 @@ signatures, but the signed root must commit to all fields above.
 
 A receiver accepts a proposer shred only if:
 
-- `target_slot` is in its acceptable window
-- `proposer_identity` appears at `proposer_index` in `proposers_at(target_slot)`
+- `target_cycle` is in its acceptable window
+- `proposer_identity` appears at `proposer_index` in
+  `proposers_at(slot_for_cycle(target_cycle))`
 - `signature` is valid
 - `shred_kind` is a known proposer data or proposer coding kind
 - the shred identity is not an inconsistent duplicate
@@ -305,7 +310,7 @@ A receiver accepts a proposer shred only if:
 The proposer shred identity is:
 
 ```
-target_slot
+target_cycle
 proposer_index
 batch_id
 fec_set_index
@@ -337,17 +342,17 @@ attester, and reconstruction bandwidth before replay rejects them.
 ### Validators
 
 Validators that act as proposers need to accept targeted MCP transactions,
-maintain slot-local balance caches, build proposer batches, erasure-encode
+maintain cycle-local balance caches, build proposer batches, erasure-encode
 those batches into proposer shreds, and sign the resulting shreds or Merkle
 roots.
 
 Validators that receive proposer shreds need to validate proposer identity,
-target slot, proposer index, signature, shred kind, and duplicate identity
+target cycle, proposer index, signature, shred kind, and duplicate identity
 before forwarding the data to later attestation or reconstruction stages.
 
 ### Dapp developers and clients
 
-Clients submitting MCP transactions need to select a target slot and target
+Clients submitting MCP transactions need to select a target cycle and target
 proposer, sign those fields, and include MCP fee and resource fields in the MCP
 transaction config mask instead of ComputeBudgetProgram instructions.
 
@@ -359,9 +364,9 @@ proposer-shred detection.
 
 ## Security Considerations
 
-The target slot, target proposer, and last valid slot are signed transaction
+The target cycle, target proposer, and last valid cycle are signed transaction
 fields. A proposer or relay cannot retarget a transaction to another proposer
-or slot without invalidating the transaction signatures.
+or cycle without invalidating the transaction signatures.
 
 The proposer fee-payer check is only a prefilter. Replay MUST still perform
 normal transaction checks and execution, because proposers do not apply account
@@ -373,14 +378,14 @@ shreds.
 
 Receivers MUST reject inconsistent duplicate proposer shreds with the same
 identity and different signed contents. These duplicates are evidence that the
-same proposer index equivocated for the same target slot, batch, FEC set,
+same proposer index equivocated for the same target cycle, batch, FEC set,
 shred index, and shred kind.
 
 ## Drawbacks *(Optional)*
 
 This adds a new transaction format, proposer-shred format, and fee-payer
 prefilter path. It also requires clients to target specific proposers and
-slots, which creates new routing and retry complexity.
+cycles, which creates new routing and retry complexity.
 
 ## Backwards Compatibility *(Optional)*
 
