@@ -33,6 +33,14 @@ stage provides that first filter without giving proposers authority to execute
 transactions, mutate account state, produce replayable blocks, or determine
 final ordering.
 
+Dedicated fee payer accounts give proposers a stronger pre-execution fee
+guarantee. Because these accounts maintain a bonded minimum fee-payer balance
+and accept additional withdrawal restrictions, proposers can initialize local
+fee-payer caches without first observing prior transactions from the account.
+MCP transactions that use a dedicated fee payer can therefore receive priority
+inclusion over transactions whose fee-payer balances must be fetched and
+discounted opportunistically.
+
 The expected outcome is a deterministic wire and validation surface for
 proposer batches. Clients can route MCP transactions to a targeted proposer,
 receivers can authenticate proposer shreds, and later stages can reconstruct
@@ -81,6 +89,10 @@ shred.
 **Cycle-local balance cache** is the proposer-local fee-payer balance cache
 used to reject transactions that cannot pay the base transaction fee and MCP
 inclusion fee.
+
+**Dedicated fee payer account** is a normal account that has opted into an
+additional fee-payer bond. While the bond is active, the account is subject to
+additional withdrawal, allocation, and ownership restrictions.
 
 ## Detailed Design
 
@@ -192,6 +204,47 @@ All other Transaction V1 constraints apply unless changed here:
 ComputeBudgetProgram instructions do not configure MCP transactions. Fee and
 resource requests come from `McpTransactionConfigMask` and `ConfigValues`.
 
+### Dedicated fee payer accounts
+
+MCP transactions MAY mark their fee payer as a dedicated fee payer account.
+Transaction V1 account indexes use `u8` values, while MCP transactions retain
+the Transaction V1 limit of at most 64 account addresses. Therefore, only the
+low six bits are needed to identify an address. MCP transactions reuse one of
+the unused high bits as a dedicated-fee-payer marker:
+
+```
+const ACCOUNT_INDEX_MASK: u8 = 0x3f
+const DEDICATED_FEE_PAYER_ACCOUNT: u8 = 0x40
+```
+
+When decoding an account index, the address index is `account_index &
+ACCOUNT_INDEX_MASK`. If `DEDICATED_FEE_PAYER_ACCOUNT` is set, the decoded
+address index MUST be the transaction fee payer index. The transaction is
+invalid if this bit is set on any other account index. The remaining high bit
+is reserved and MUST be unset.
+
+If no account index referring to the fee payer carries
+`DEDICATED_FEE_PAYER_ACCOUNT`, the proposer treats the transaction as using a
+standard fee payer.
+
+A dedicated fee payer account is otherwise a normal account, but it carries an
+additional fee-payer bond. The account's bonded minimum balance is the balance
+that proposers MAY use to initialize their cycle-local fee-payer balance cache
+before seeing any prior transactions for that account in the target cycle.
+
+While the dedicated fee-payer bond is active:
+
+- The account MUST NOT allocate data.
+- The account MUST NOT transfer ownership.
+- The account MUST NOT withdraw below its bonded minimum balance except through
+  the dedicated fee-payer withdrawal path.
+- A dedicated fee-payer withdrawal MUST be held for at least 400 ms before the
+  withdrawn lamports become available.
+
+The withdrawal hold gives in-flight proposers time to stop relying on the old
+bonded minimum balance. During the hold, proposers continue to treat the
+pre-withdrawal bonded minimum as the account's dedicated fee-payer cache floor.
+
 ### Fee payer check logic
 
 The proposer performs fee-payer checks against a candidate parent bank for the
@@ -227,10 +280,13 @@ proposer_index
 ```
 
 On first use of a fee payer, the proposer loads the fee payer account from the
-base bank and stores its lamport balance in the cache. If the cached balance is
-less than the computed fee, the proposer drops the transaction. Otherwise, the
-proposer subtracts the fee from the cached balance and may add the transaction
-to the batch.
+base bank. If the transaction marks the fee payer as a dedicated fee payer
+account, the proposer verifies that the account is a valid dedicated fee payer
+account and initializes the cache with the account's bonded minimum balance.
+Otherwise, the proposer stores the account's lamport balance in the cache. If
+the cached balance is less than the computed fee, the proposer drops the
+transaction. Otherwise, the proposer subtracts the fee from the cached balance
+and may add the transaction to the batch.
 
 If any account in the transaction may be debited during execution, and that
 account is used as an instruction account, the proposer conservatively sets
@@ -336,6 +392,11 @@ Proposers could build batches without fee-payer checks. That would simplify the
 proposer role, but it would let unpaid transactions consume proposer,
 attester, and reconstruction bandwidth before replay rejects them.
 
+Dedicated fee payer accounts could be represented with a separate transaction
+config field instead of an account-index marker. Reusing an unused account-index
+bit avoids spending another config bit and keeps the marker attached to the
+account it qualifies, at the cost of making account-index decoding MCP-specific.
+
 ## Impact
 
 ### Validators
@@ -343,7 +404,9 @@ attester, and reconstruction bandwidth before replay rejects them.
 Validators that act as proposers need to accept targeted MCP transactions,
 maintain cycle-local balance caches, build proposer batches, erasure-encode
 those batches into proposer shreds, and sign the resulting shreds or Merkle
-roots.
+roots. They also need to recognize dedicated fee payer accounts and initialize
+the local fee-payer cache from the bonded minimum balance when the transaction
+uses the dedicated fee-payer marker.
 
 Validators that receive proposer shreds need to validate proposer identity,
 target cycle, proposer index, signature, shred kind, and duplicate identity
@@ -353,13 +416,18 @@ before forwarding the data to later attestation or reconstruction stages.
 
 Clients submitting MCP transactions need to select a target cycle and target
 proposer, sign those fields, and include MCP fee and resource fields in the MCP
-transaction config mask instead of ComputeBudgetProgram instructions.
+transaction config mask instead of ComputeBudgetProgram instructions. Clients
+that want priority inclusion through a dedicated fee payer need to opt the fee
+payer account into the dedicated fee-payer bond and set the dedicated fee-payer
+account-index marker.
 
 ### Core contributors
 
 Core protocol implementations need new transaction parsing, proposer-shred wire
 types, proposer schedule lookups, fee-payer balance-cache logic, and duplicate
-proposer-shred detection.
+proposer-shred detection. Runtime implementations also need dedicated
+fee-payer account state and enforcement for withdrawal, allocation, and
+ownership restrictions.
 
 ## Security Considerations
 
@@ -370,6 +438,11 @@ or cycle without invalidating the transaction signatures.
 The proposer fee-payer check is only a prefilter. Replay MUST still perform
 normal transaction checks and execution, because proposers do not apply account
 writes to the base bank and may only have a conservative balance-cache view.
+
+Dedicated fee payer accounts make proposer fee-payer checks stronger, but only
+if the bonded minimum balance cannot be withdrawn or invalidated faster than
+proposers can stop relying on it. The 400 ms withdrawal hold, allocation
+restriction, and ownership restriction are part of that guarantee.
 
 Proposer shreds use a distinct wire variant and identity namespace. This
 prevents proposer shreds from being inserted or replayed as normal leader block
@@ -385,6 +458,10 @@ shred index, and shred kind.
 This adds a new transaction format, proposer-shred format, and fee-payer
 prefilter path. It also requires clients to target specific proposers and
 cycles, which creates new routing and retry complexity.
+
+Dedicated fee payer accounts also add a new account mode and impose liquidity
+costs on users who want priority inclusion. The 400 ms withdrawal hold improves
+fee certainty for proposers, but delays access to bonded lamports.
 
 ## Backwards Compatibility *(Optional)*
 
