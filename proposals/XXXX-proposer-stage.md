@@ -109,9 +109,10 @@ decide final transaction order.
 ### MCP transaction format
 
 An MCP transaction is a Transaction V1-derived signed transaction. It keeps the
-Transaction V1 account, instruction, lifetime, config, and signature layout,
-but uses an MCP transaction config mask that adds required target cycle, target
-proposer, and last valid cycle fields.
+Transaction V1 account, instruction, config, and signature layout, but replaces
+Transaction V1's `LifetimeSpecifier` with required `target_cycle` and
+`last_valid_cycle` config fields. These cycle fields define the transaction's
+proposer-stage lifetime.
 
 The encoded transaction is:
 
@@ -119,7 +120,6 @@ The encoded transaction is:
 VersionByte
 LegacyHeader
 McpTransactionConfigMask
-LifetimeSpecifier
 NumInstructions
 NumAddresses
 Addresses
@@ -173,7 +173,7 @@ is not a valid index for the target cycle's proposer committee.
 `last_valid_cycle` is required. It is the last cycle in which the target
 proposer may accept the transaction, encoded as a little-endian `u64`. The
 transaction is invalid if exactly one of bits 10 or 11 is set, or if neither
-bit is set.
+bit is set. The transaction is invalid if `last_valid_cycle < target_cycle`.
 
 The signed message is every field before `Signatures`, including
 `McpTransactionConfigMask`, `ConfigValues`, and therefore `target_cycle`,
@@ -206,11 +206,10 @@ For each received MCP transaction, the proposer:
    `last_valid_cycle`
 4. sanitizes the transaction
 5. verifies all required signatures
-6. verifies that `LifetimeSpecifier` is usable from the base bank
-7. computes the fee from the base bank fee rules, including the MCP inclusion
+6. computes the fee from the base bank fee rules, including the MCP inclusion
    fee
-8. checks the fee payer balance using the cycle-local balance cache
-9. accepts the transaction into the proposer batch only if the cache can pay
+7. checks the fee payer balance using the cycle-local balance cache
+8. accepts the transaction into the proposer batch only if the cache can pay
    the computed fee
 
 The fee payer is the first writable signer, matching Transaction V1 account
